@@ -18,12 +18,14 @@ class SymbolicEngine:
 
     def inject_symbolic_input(self, name="sym_input", size_bytes=32):
         """
-        Demonstrates injecting a symbolic variable (e.g., standard input).
+        Injects a symbolic variable as standard input using a SimFile wrapper.
         """
         sym_var = claripy.BVS(name, size_bytes * 8)
+        # Use SimFile to properly constraint size and avoid immediate concrete-evaluation
+        sim_stdin = angr.SimFile(name="stdin", content=sym_var, size=size_bytes)
         # Re-initialize the state and simgr with the symbolic input on stdin
-        self.state = self.project.factory.entry_state(stdin=sym_var)
-        self.simgr = self.project.factory.simulation_manager(self.state)
+        self.state = self.project.factory.entry_state(stdin=sim_stdin)
+        self.simgr = self.project.factory.simulation_manager(self.state, save_unsat=True)
         return sym_var
 
     def step(self):

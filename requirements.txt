@@ -6,3 +6,7 @@ dash-cytoscape
 dash-bootstrap-components
 pandas
 markdown
+plotly
+rich
+gitpython
+requests
