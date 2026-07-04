@@ -443,7 +443,9 @@ class AnalysisBackendProvider:
         self.engine.simgr = self.engine.project.factory.simulation_manager(self.engine.state, save_unsat=True)
         
         # Stack elements: (current_state, parent_execution_state, depth, path_history_set)
-        stack = [(self.engine.state, None, 0, frozenset([self.engine.state.addr]))]
+        stack: List[Tuple[Any, Optional[ExecutionState], int, frozenset]] = [
+            (self.engine.state, None, 0, frozenset([self.engine.state.addr]))
+        ]
         
         active_stash = []
         deadended_stash = []
@@ -628,8 +630,8 @@ class AnalysisBackendProvider:
         self.engine.simgr.errored.clear()
         for s in errored_stash:
             try:
-                from angr.manager import ErrorRecord
-                self.engine.simgr.errored.append(ErrorRecord(s, Exception("Execution error"), None))
+                import angr.sim_manager
+                self.engine.simgr.errored.append(angr.sim_manager.ErrorRecord(s, Exception("Execution error"), None))
             except Exception:
                 pass
         

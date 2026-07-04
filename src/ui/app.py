@@ -945,7 +945,7 @@ def create_app() -> dash.Dash:
             trace: List[dict] = []
             sat_n = unsat_n = total_constraints = total_solver_time = 0
             for state_obj in raw_trace:
-                d = asdict(state_obj)
+                d: Dict[str, Any] = asdict(state_obj)
                 smt_obj = backend.get_constraint_result(state_obj)
                 sd = asdict(smt_obj)
                 d["smt_diagnostics"] = sd
@@ -1577,7 +1577,7 @@ def create_app() -> dash.Dash:
             return "No matching nodes found."
         
         # Display up to 5 matching nodes as clickable buttons
-        results = [html.Div("Matches:", style={"fontWeight": "bold", "marginBottom": "3px"})]
+        results: List[Any] = [html.Div("Matches:", style={"fontWeight": "bold", "marginBottom": "3px"})]
         for name, addr in matches[:5]:
             results.append(html.Button(f"• {name} ({addr})", id={"type": "search-match", "addr": addr}, n_clicks=0, style={
                 "fontFamily": "JetBrains Mono, monospace", "fontSize": "11px",
