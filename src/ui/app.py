@@ -234,6 +234,7 @@ EVENT_META: Dict[str, tuple] = {
     "LOOP":         ("↻",  "LOOP",     "#063535", "#39d353"),
     "LIBRARY_CALL": ("📚", "LIB CALL", "#1a0f3d", "#8957e5"),
     "SYSCALL":      ("⚙",  "SYSCALL",  "#2d2009", "#d29922"),
+    "CRASH":        ("💥", "CRASH",    "#3d0d0d", "#f85149"),
     "NORMAL":       ("→",  "NORMAL",   "#21262d", "#8b949e"),
 }
 
@@ -468,9 +469,12 @@ def _make_report(filename: str, trace: List[dict], metrics: dict, ts: str) -> st
         for k, v in (metrics or {}).items() if k != "filename"
     )
 
+    crash_states = [s for s in trace if s.get("event_type") == "CRASH"]
+
     findings = [
         ("Total execution states",   len(trace)),
         ("Branch points",            sum(1 for s in trace if s.get("is_branch"))),
+        ("Crash points found",       len(crash_states)),
         ("Library calls",            sum(1 for s in trace if s.get("event_type") == "LIBRARY_CALL")),
         ("Loop back-edges",          sum(1 for s in trace if s.get("event_type") == "LOOP")),
         ("Return events",            sum(1 for s in trace if s.get("event_type") == "RETURN")),
@@ -479,6 +483,29 @@ def _make_report(filename: str, trace: List[dict], metrics: dict, ts: str) -> st
         ("Unique functions visited", len(set(s.get("function_name", "") for s in trace))),
     ]
     fr = "".join(f"<tr><td>{k}</td><td><strong>{v}</strong></td></tr>" for k, v in findings)
+
+    if crash_states:
+        crash_rows = ""
+        for s in crash_states:
+            smt = s.get("smt_diagnostics", {})
+            model = (smt.get("model") or "No concrete model computed.").replace("\n", "<br>")
+            crash_rows += (
+                f"<div style='background:#1a0d0d;border:1px solid #f85149;border-radius:6px;"
+                f"padding:14px;margin-top:10px'>"
+                f"<div style='color:#f85149;font-weight:700;font-family:monospace'>"
+                f"💥 Crash at {s.get('instruction_address','')} — {s.get('function_name','')}</div>"
+                f"<div style='font-size:12px;color:#8b949e;margin-top:6px'>{s.get('explanation','')}</div>"
+                f"<div style='font-size:12px;color:#e6edf3;margin-top:8px;font-family:monospace;"
+                f"white-space:pre-wrap'><strong>Breaking input:</strong><br>{model}</div>"
+                f"</div>"
+            )
+        crash_section = f"<h2>🎯 Crash Analysis — Exact Breaking Input</h2>{crash_rows}"
+    else:
+        crash_section = (
+            "<h2>🎯 Crash Analysis</h2><p style='color:#8b949e'>"
+            "No crash states (symbolic/unconstrained instruction pointer or execution errors) "
+            "were encountered on the explored paths.</p>"
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -507,6 +534,7 @@ tr:nth-child(even)td{{background:#0d1117}}tr:nth-child(odd)td{{background:#161b2
 <p style="color:#8b949e">Binary: <code style="color:#58a6ff">{filename}</code>
 &nbsp;·&nbsp;Generated: {ts}</p>
 <h2>Analysis Metrics</h2><div class="mg">{mc}</div>
+{crash_section}
 <h2>Execution Trace ({len(trace)} states)</h2>
 <table><thead><tr>
   <th>#</th><th>Address</th><th>Function</th><th>Event</th><th>Explanation</th><th>SMT</th>
@@ -799,6 +827,26 @@ def create_app() -> dash.Dash:
                  style=_merge(_card_s, {"borderLeft": "3px solid var(--purple)",
                                         "marginBottom": "0"})),
 
+        _hr,
+
+        # Vulnerability findings header
+        html.Div([
+            _section("Vulnerability Findings", "--red"),
+            html.Button("🔻 Collapse", id="btn-toggle-findings", n_clicks=0, style={
+                "backgroundColor": "transparent", "color": "var(--muted)",
+                "border": "1px solid var(--border)", "borderRadius": "4px",
+                "padding": "3px 10px", "cursor": "pointer",
+                "fontSize": "11px", "fontFamily": "Inter, sans-serif",
+            }),
+        ], style={"display": "flex", "justifyContent": "space-between",
+                  "alignItems": "center", "marginBottom": "10px"}),
+
+        html.Div(id="findings-viewer",
+                 children=html.Div("Upload a binary to run the vulnerability scan.",
+                                   style={"color": "var(--muted)", "fontSize": "12px"}),
+                 style=_merge(_card_s, {"borderLeft": "3px solid var(--red)",
+                                        "marginBottom": "0"})),
+
         # Stores + interval
         dcc.Interval(id="play-interval", interval=900, n_intervals=0, disabled=True),
         dcc.Store(id="cfg-store"),
@@ -807,6 +855,8 @@ def create_app() -> dash.Dash:
         dcc.Store(id="trace-index",      data=0),
         dcc.Store(id="play-state",       data=False),
         dcc.Store(id="advanced-visible",   data=False),
+        dcc.Store(id="findings-store",   data=[]),
+        dcc.Store(id="findings-visible", data=True),
         dcc.Store(id="metrics-store",    data={}),
         dcc.Store(id="binary-info-store", data={}),
         dcc.Store(id="theme-store",      data="dark"),
@@ -912,6 +962,7 @@ def create_app() -> dash.Dash:
         Output("trace-store",      "data"),
         Output("metrics-store",    "data"),
         Output("binary-info-store","data"),
+        Output("findings-store",   "data"),
         Input("upload-binary",     "contents"),
         State("upload-binary",     "filename"),
         prevent_initial_call=True,
@@ -966,7 +1017,15 @@ def create_app() -> dash.Dash:
             
             # Calculate dynamic branch coverage using CFG edges
             discovered_branches = [node for node in nx_cfg.nodes() if nx_cfg.out_degree(node) > 1]
-            visited_nodes = {int(s.get("instruction_address", "0"), 16) for s in trace if s.get("instruction_address")}
+            visited_nodes = set()
+            for s in trace:
+                addr_str = s.get("instruction_address")
+                if not addr_str or not addr_str.startswith("0x"):
+                    continue  # skip non-address markers like CRASH's 'SYMBOLIC (unconstrained IP)'
+                try:
+                    visited_nodes.add(int(addr_str, 16))
+                except ValueError:
+                    continue
             total_branch_edges = sum(nx_cfg.out_degree(node) for node in discovered_branches)
             visited_branch_edges = 0
             
@@ -1046,13 +1105,19 @@ def create_app() -> dash.Dash:
                 "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
+            try:
+                findings = backend.get_vulnerability_findings()
+                findings_data = [asdict(f) for f in findings]
+            except Exception:
+                findings_data = []
+
             return (
                 f"✅  {filename}  —  analyzed in {elapsed}s",
-                cfg_elements, cg_elements, trace, metrics, binary_info,
+                cfg_elements, cg_elements, trace, metrics, binary_info, findings_data,
             )
 
         except Exception as exc:
-            return f"❌  Error: {exc}", [], [], [], {}, {}
+            return f"❌  Error: {exc}", [], [], [], {}, {}, []
 
     # Trace index navigation + graph selection + search match jump
     @app.callback(
@@ -1151,6 +1216,120 @@ def create_app() -> dash.Dash:
     )
     def toggle_advanced(n, cur):
         return (not cur) if n else cur
+
+    # Toggle vulnerability findings collapse
+    @app.callback(
+        Output("findings-visible", "data"),
+        Output("btn-toggle-findings", "children"),
+        Input("btn-toggle-findings", "n_clicks"),
+        State("findings-visible",    "data"),
+    )
+    def toggle_findings(n, cur):
+        if not n:
+            return cur, ("🔻 Collapse" if cur else "🔺 Expand")
+        new_val = not cur
+        return new_val, ("🔻 Collapse" if new_val else "🔺 Expand")
+
+    _CONFIDENCE_META = {
+        "z3-confirmed": ("💥", "#3d0d0d", "#f85149", "Z3-CONFIRMED"),
+        "static":       ("🔗", "#2d2409", "#e3b341", "STATIC (call graph)"),
+        "heuristic":    ("🧭", "#1a2233", "#79c0ff", "STATIC (heuristic)"),
+        "textual":      ("🔑", "#1a0f3d", "#8957e5", "TEXTUAL SCAN"),
+    }
+    _SEVERITY_COLOR = {
+        "Critical": "#f85149", "High": "#e3b341", "Medium": "#79c0ff", "Low": "#8b949e",
+    }
+
+    def _render_finding_card(f: dict) -> html.Div:
+        conf = f.get("confidence", "heuristic")
+        icon, bg, fg, conf_label = _CONFIDENCE_META.get(conf, _CONFIDENCE_META["heuristic"])
+        sev = f.get("severity", "Medium")
+        sev_color = _SEVERITY_COLOR.get(sev, "#8b949e")
+        status = f.get("status", "N/A")
+        status_color = "#3fb950" if status == "SAT" else "#f85149" if status == "UNSAT" else "#8b949e"
+
+        return html.Div([
+            html.Div([
+                html.Span(f.get("finding_id", "finding"), style={
+                    "fontFamily": "JetBrains Mono, monospace", "fontWeight": "700",
+                    "fontSize": "13px", "color": "var(--text)",
+                }),
+                html.Span(f"{icon} {conf_label}", style={
+                    "backgroundColor": bg, "color": fg, "borderRadius": "4px",
+                    "padding": "2px 8px", "fontSize": "10px", "fontWeight": "600",
+                    "marginLeft": "8px",
+                }),
+                html.Span(sev, style={
+                    "color": sev_color, "fontSize": "10px", "fontWeight": "700",
+                    "float": "right", "textTransform": "uppercase",
+                }),
+            ], style={"marginBottom": "6px"}),
+
+            html.Div([
+                (html.Span(f.get("cwe"), style={
+                    "fontFamily": "JetBrains Mono, monospace", "color": "var(--muted)",
+                    "fontSize": "11px", "marginRight": "10px",
+                }) if f.get("cwe") else None),
+                html.Span(status, style={
+                    "fontFamily": "JetBrains Mono, monospace", "color": status_color,
+                    "fontSize": "11px", "fontWeight": "700",
+                }),
+            ], style={"marginBottom": "8px"}),
+
+            html.Div([
+                html.Strong("Constraint: ", style={"color": "var(--muted)", "fontSize": "11px"}),
+                html.Span(f.get("constraint", ""), style={
+                    "fontFamily": "JetBrains Mono, monospace", "fontSize": "11px", "color": "var(--text)",
+                }),
+            ], style={"marginBottom": "4px"}),
+
+            html.Div([
+                html.Strong("Witness: ", style={"color": "var(--muted)", "fontSize": "11px"}),
+                html.Span(f.get("witness", ""), style={
+                    "fontFamily": "JetBrains Mono, monospace", "fontSize": "11px", "color": "#3fb950",
+                    "wordBreak": "break-all",
+                }),
+            ], style={"marginBottom": "4px"}),
+
+            html.Div([
+                html.Strong("Reason: ", style={"color": "var(--muted)", "fontSize": "11px"}),
+                html.Span(f.get("reason", ""), style={"fontSize": "11px", "color": "var(--text)"}),
+            ], style={"marginBottom": "4px"}),
+
+            (html.Div(f"@ {f.get('address')} · {f.get('function_name')}", style={
+                "fontSize": "10px", "color": "var(--muted)", "marginTop": "6px",
+                "fontFamily": "JetBrains Mono, monospace",
+            }) if f.get("address") else None),
+        ], style={
+            "border": f"1px solid {fg}", "borderRadius": "6px", "padding": "12px",
+            "marginBottom": "10px", "backgroundColor": "var(--card)",
+        })
+
+    @app.callback(
+        Output("findings-viewer", "children"),
+        Input("findings-store",   "data"),
+        Input("findings-visible", "data"),
+    )
+    def render_findings(findings, visible):
+        if not findings:
+            return html.Div("No findings yet — upload a binary to run the vulnerability scan.",
+                             style={"color": "var(--muted)", "fontSize": "12px"})
+        if not visible:
+            crit = sum(1 for f in findings if f.get("severity") == "Critical")
+            high = sum(1 for f in findings if f.get("severity") == "High")
+            return html.Div(
+                f"{len(findings)} finding(s) — {crit} critical, {high} high. Click Expand to view.",
+                style={"color": "var(--muted)", "fontSize": "12px"}
+            )
+
+        # Z3-confirmed findings first (highest confidence), then by severity.
+        sev_rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+        conf_rank = {"z3-confirmed": 0, "static": 1, "heuristic": 2, "textual": 3}
+        ordered = sorted(
+            findings,
+            key=lambda f: (conf_rank.get(f.get("confidence"), 9), sev_rank.get(f.get("severity"), 9))
+        )
+        return [_render_finding_card(f) for f in ordered]
 
     # Main rendering: graph elements + right-panel content
     @app.callback(

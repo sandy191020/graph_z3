@@ -1,0 +1,12 @@
+{
+  "python.defaultInterpreterPath": "/Volumes/PortableSSD/graph_z3/venv/bin/python3",
+  "python.analysis.extraPaths": [
+    "/Volumes/PortableSSD/graph_z3"
+  ],
+  "python.linting.enabled": true,
+  "python.linting.pylintEnabled": false,
+  "python.linting.flake8Enabled": false,
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.python"
+  }
+}

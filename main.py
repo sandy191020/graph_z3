@@ -1,8 +1,10 @@
 import sys
 import os
 
-# Add the project root to the path so we can import src modules
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# Add the project root and src to the path so we can import src modules
+project_root = os.path.abspath(os.path.dirname(__file__))
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
 from src.ui.app import create_app
 

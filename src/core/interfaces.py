@@ -5,6 +5,7 @@ import time
 from core.binary_loader import BinaryLoader
 from symbolic.engine import SymbolicEngine
 from symbolic.z3_interface import Z3Interface
+from analysis.vuln_scanner import VulnerabilityScanner, VulnFinding, compact_witness, first_meaningful_line
 
 
 @dataclass
@@ -55,6 +56,12 @@ _OP_SYMBOLS = {
     '__xor__': '^', '__and__': '&', '__or__': '|',
     '__lshift__': '<<', 'LShR': '>>', '__rshift__': '>>',
 }
+
+
+def _slugify_local(name: str) -> str:
+    import re as _re
+    s = _re.sub(r'[^a-zA-Z0-9]+', '_', name).strip('_').lower()
+    return s or "unnamed"
 
 
 def _fmt_constant(value: int, bits: int) -> str:
@@ -432,6 +439,69 @@ class AnalysisBackendProvider:
         except Exception:
             return "Unknown", False
 
+    def _build_crash_state(self, state, parent_state, depth, reason: str, err_str: str,
+                            path_history, addr_hex: Optional[str] = None) -> ExecutionState:
+        """
+        Builds an ExecutionState for a crash (symbolic/unconstrained IP, or any
+        exception while stepping). Unlike a dropped/ignored error, this keeps
+        the state's real path constraints and registers it for Z3 solving, so
+        the SMT panel can produce the exact concrete input that reaches and
+        triggers this crash — that's the whole point of finding a breaking point.
+        """
+        func_name = parent_state.function_name if parent_state else "Unknown"
+        is_lib = parent_state.is_library if parent_state else False
+        prev_block_hex = parent_state.basic_block if parent_state else ""
+        display_addr = addr_hex or "SYMBOLIC (unconstrained IP)"
+
+        try:
+            constraints = list(state.solver.constraints)
+        except Exception:
+            constraints = []
+
+        try:
+            is_sat = state.solver.satisfiable() if constraints or True else False
+        except Exception:
+            is_sat = False
+
+        humanized = [_humanize_constraint(c) for c in constraints]
+        raw_strs = [str(c) for c in constraints]
+
+        vars_dict = get_symbolic_variables_from_state(state, self.symbolic_variables)
+
+        explanation = (
+            f"Execution crashed after leaving '{func_name}' (last known block {prev_block_hex}): {reason}. "
+            f"Underlying error: {err_str}. "
+            f"The path constraints accumulated up to this point are still fully solvable — see the SMT "
+            f"panel below for the exact concrete input that drives execution down this path and triggers "
+            f"the crash."
+        )
+
+        exec_state = ExecutionState(
+            function_name=f"{func_name} (crashed)",
+            basic_block=display_addr,
+            instruction_address=display_addr,
+            execution_depth=depth,
+            symbolic_variables=(", ".join(vars_dict.keys()) if vars_dict else "None tracked yet"),
+            path_constraints=("\n".join(f"- {h}" for h in humanized) if humanized else "No constraints accumulated yet."),
+            solver_status="SAT" if is_sat else "UNSAT",
+            model_information=f"Crash detected: {reason}",
+            explanation=explanation,
+            next_state="CRASHED (analysis halted on this path)",
+            is_library=is_lib,
+            is_branch=False,
+            raw_path_constraints=("\n".join(raw_strs) if raw_strs else ""),
+            event_type="CRASH",
+            previous_block=prev_block_hex,
+            next_block="Crashed",
+            transferred_function=False,
+            new_constraints_introduced=False,
+        )
+
+        # THE FIX: register the crash state so get_constraint_result can run
+        # Z3 against it, instead of silently dropping its solver session.
+        self._state_registry[id(exec_state)] = (state, vars_dict)
+        return exec_state
+
     def get_execution_trace(self) -> List[ExecutionState]:
         """Runs live symbolic execution and returns enriched ExecutionState objects using DFS."""
         if self._trace_cache is not None:
@@ -454,8 +524,25 @@ class AnalysisBackendProvider:
         
         while stack and len(states) < self.max_steps:
             state, parent_state, depth, path_history = stack.pop()
-            
-            addr = state.addr
+
+            # A symbolic/unconstrained instruction pointer is the classic
+            # signature of a control-flow-hijack crash (e.g. an overwritten
+            # return address from a stack buffer overflow). Previously this
+            # was unguarded and would kill the entire trace-building call
+            # before any crash could ever be reported.
+            try:
+                addr = state.addr
+            except Exception as e:
+                errored_stash.append(state)
+                exec_state = self._build_crash_state(
+                    state, parent_state, depth,
+                    reason="Instruction pointer became symbolic/unconstrained (classic control-flow-hijack crash signature)",
+                    err_str=str(e),
+                    path_history=path_history,
+                )
+                states.append(exec_state)
+                continue
+
             addr_hex = hex(addr)
             func_name, is_lib = self._resolve_function_info(addr)
             
@@ -468,25 +555,12 @@ class AnalysisBackendProvider:
                 successors = self.engine.project.factory.successors(state)
             except Exception as e:
                 errored_stash.append(state)
-                exec_state = ExecutionState(
-                    function_name=func_name,
-                    basic_block=addr_hex,
-                    instruction_address=addr_hex,
-                    execution_depth=depth,
-                    symbolic_variables="None",
-                    path_constraints="",
-                    solver_status="UNSAT",
-                    model_information=f"Execution error: {str(e)}",
-                    explanation=f"Execution failed/errored at {addr_hex} in '{func_name}': {str(e)}",
-                    next_state="Errored (Crashed)",
-                    is_library=is_lib,
-                    is_branch=False,
-                    raw_path_constraints="",
-                    event_type="NORMAL",
-                    previous_block=prev_block_hex,
-                    next_block="Errored",
-                    transferred_function=transferred,
-                    new_constraints_introduced=False,
+                exec_state = self._build_crash_state(
+                    state, parent_state, depth,
+                    reason=f"Execution engine failed to compute successors of block {addr_hex} in '{func_name}'",
+                    err_str=str(e),
+                    path_history=path_history,
+                    addr_hex=addr_hex,
                 )
                 states.append(exec_state)
                 continue
@@ -740,3 +814,83 @@ class AnalysisBackendProvider:
             constraint_annotations=annotations,
             symbolic_variables_list=sym_vars_list,
         )
+
+    def get_vulnerability_findings(self) -> List[VulnFinding]:
+        """
+        Combines two tiers of findings:
+
+        1. Static/heuristic CWE pattern detection (dangerous library calls
+           via the real call graph, off-by-one loop bounds, sign-confusion
+           casts, missing-null-check derefs, leak candidates, hardcoded
+           credentials). These say "STATIC" / "STATIC (heuristic)" and are
+           not solver-confirmed.
+
+        2. Z3-confirmed findings derived from any CRASH states reached
+           during get_execution_trace() (see _build_crash_state above) —
+           these carry a real SAT/UNSAT status and a concrete witness input
+           computed by Z3 against the binary's actual path constraints.
+        """
+        findings: List[VulnFinding] = []
+
+        try:
+            scanner = VulnerabilityScanner(self.loader)
+            findings.extend(scanner.scan_static())
+        except Exception as e:
+            findings.append(VulnFinding(
+                finding_id="static_scan_error",
+                function_name="(scanner)",
+                cwe=None,
+                title="Static Scan Error",
+                status="N/A",
+                constraint="N/A",
+                witness="N/A",
+                reason=f"The static vulnerability scanner failed to complete: {e}",
+                severity="Low",
+                confidence="static",
+            ))
+
+        try:
+            trace = self.get_execution_trace()
+        except Exception:
+            trace = []
+
+        crash_states = [s for s in trace if getattr(s, 'event_type', None) == "CRASH"]
+
+        for i, state in enumerate(crash_states):
+            entry = self._state_registry.get(id(state))
+            witness = "No concrete model computed for this crash state."
+            status = state.solver_status
+            constraint_line = first_meaningful_line(state.path_constraints)
+
+            if entry is not None:
+                raw_state, vars_dict = entry
+                try:
+                    result = Z3Interface.evaluate_path(raw_state, vars_dict)
+                    status = result.get("status", status)
+                    sat_assignment = result.get("satisfying_assignment", {})
+                    pieces = []
+                    for name, sym_var in vars_dict.items():
+                        val = sat_assignment.get(name)
+                        if isinstance(val, (bytes, bytearray)):
+                            constrained_bytes, _ = get_byte_status(raw_state, sym_var)
+                            pieces.append(f"{name} = " + compact_witness(bytes(val), set(constrained_bytes)))
+                    if pieces:
+                        witness = "; ".join(pieces)
+                except Exception:
+                    pass
+
+            findings.append(VulnFinding(
+                finding_id=f"crash_{i + 1}_{_slugify_local(state.function_name)}",
+                function_name=state.function_name,
+                cwe="CWE-120",
+                title="Control-Flow Hijack / Memory Corruption",
+                status=status,
+                constraint=constraint_line,
+                witness=witness,
+                reason=state.explanation,
+                severity="Critical",
+                address=state.instruction_address,
+                confidence="z3-confirmed",
+            ))
+
+        return findings
